@@ -1,0 +1,19 @@
+[package]
+name = "rfidEncoder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libloading = "0.8"
+bitflags = "2.4"
+
+tokio = { version = "1.42", features = ["full"] }
+
+axum = "0.7"
+tower-http = { version = "0.6", features = ["cors"] }
+hyper = { version = "1.5", features = ["full"] }
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+chrono = "0.4"

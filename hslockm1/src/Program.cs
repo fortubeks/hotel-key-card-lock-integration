@@ -10,6 +10,8 @@ internal static class Program
 {
     private static readonly JavaScriptSerializer Json = new JavaScriptSerializer();
     private static string ApiToken = "default_secret";
+    private static string SectorPath;
+    private static int DriverInitializationStatus = -1;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct V2CardInfo
@@ -31,6 +33,12 @@ internal static class Program
     [DllImport("libDriverWrapper_M1.dll", CallingConvention = CallingConvention.Winapi, CharSet = CharSet.Ansi, ExactSpelling = true)]
     private static extern int V2ClearCardEx(string portName, int sector);
 
+    [DllImport("libDriver_M1-0.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern int BuildDriver();
+
+    [DllImport("libDriver_M1-0.dll", CallingConvention = CallingConvention.Cdecl, ExactSpelling = true)]
+    private static extern int DestroyDriver();
+
     private sealed class CardRequest
     {
         public int hotel_id { get; set; }
@@ -43,8 +51,16 @@ internal static class Program
     {
         string applicationDirectory = AppDomain.CurrentDomain.BaseDirectory;
         Directory.SetCurrentDirectory(applicationDirectory);
+        SectorPath = Path.Combine(applicationDirectory, "sector.cfg");
         string tokenPath = Path.Combine(applicationDirectory, "auth");
         if (File.Exists(tokenPath)) ApiToken = File.ReadAllText(tokenPath).Trim();
+
+        DriverInitializationStatus = BuildDriver();
+        Console.WriteLine("HS Lock native driver initialization status: " + DriverInitializationStatus);
+        AppDomain.CurrentDomain.ProcessExit += delegate
+        {
+            if (DriverInitializationStatus == 0) DestroyDriver();
+        };
 
         HttpListener listener = new HttpListener();
         listener.Prefixes.Add("http://127.0.0.1:9001/");
@@ -70,7 +86,16 @@ internal static class Program
             string path = context.Request.Url.AbsolutePath.TrimEnd('/');
             if (context.Request.HttpMethod == "GET" && path == "/test")
             {
-                WriteJson(context.Response, new { status = "success", driver = "HS Lock SDK 2022 M1 Standalone", sector = 1 });
+                WriteJson(context.Response, new {
+                    status = DriverInitializationStatus == 0 ? "success" : "error",
+                    driver = "HS Lock SDK 2022 M1 Standalone",
+                    initialization_status = DriverInitializationStatus,
+                    sector = SavedSector()
+                });
+            }
+            else if (DriverInitializationStatus != 0)
+            {
+                WriteJson(context.Response, new { status = "error", message = "HS Lock native driver initialization failed", initialization_status = DriverInitializationStatus });
             }
             else if (context.Request.HttpMethod == "GET" && path == "/card/read-guest") ReadCard(context);
             else if (context.Request.HttpMethod == "POST" && path == "/card/make-guest") WriteCard(context);
@@ -88,8 +113,20 @@ internal static class Program
     {
         string port = NormalizePort(context.Request.QueryString["port_name"]);
         V2CardInfo card = new V2CardInfo();
-        int code = V2ReadCardEx(port, 1, ref card);
-        if (code != 0) { SdkError(context.Response, "read", code, port); return; }
+        int sector;
+        int code;
+        if (!TryReadCard(port, out card, out sector, out code))
+        {
+            WriteJson(context.Response, new {
+                status = "error",
+                message = "HS Lock read failed: no valid HS M1 card data was found in sectors 1-15. Close the original lock software and use an existing encoded guest card.",
+                sdk_code = code,
+                port_name = port,
+                sectors_tested = "1-15"
+            });
+            return;
+        }
+        SaveSector(sector);
 
         WriteJson(context.Response, new {
             status = "success",
@@ -101,7 +138,7 @@ internal static class Program
                 checkin_time = DateValue(card.NowYear, card.NowMonth, card.NowDay, card.NowHour, card.NowMinute),
                 checkout_time = DateValue(card.EndYear, card.EndMonth, card.EndDay, card.EndHour, card.EndMinute),
                 port_name = port,
-                sector = 1
+                sector = sector
             }
         });
     }
@@ -123,26 +160,28 @@ internal static class Program
             Ext0 = 255, Ext1 = 255, Ext2 = 255, Ext3 = 15, Ext4 = 255, Ext5 = 255, Ext6 = 255, Ext7 = 15
         };
         string port = NormalizePort(request.port_name);
-        int code = V2WriteCardEx(port, 1, ref card);
-        if (code != 0) { SdkError(context.Response, "write", code, port); return; }
+        int sector = SavedSector();
+        int code = V2WriteCardEx(port, sector, ref card);
+        if (code != 0) { SdkError(context.Response, "write", code, port, sector); return; }
 
         V2CardInfo verified = new V2CardInfo();
-        int verifyCode = V2ReadCardEx(port, 1, ref verified);
+        int verifyCode = V2ReadCardEx(port, sector, ref verified);
         if (verifyCode != 0 || verified.HotelId != request.hotel_id || LockNumber(verified) != request.lock_no)
         {
             WriteJson(context.Response, new { status = "error", message = "Card was written but verification failed", sdk_code = verifyCode });
             return;
         }
-        WriteJson(context.Response, new { status = "success", message = "HS Lock guest card written and verified", lock_no = request.lock_no });
+        WriteJson(context.Response, new { status = "success", message = "HS Lock guest card written and verified", lock_no = request.lock_no, sector = sector });
     }
 
     private static void ClearCard(HttpListenerContext context)
     {
         CardRequest request = Body<CardRequest>(context.Request) ?? new CardRequest();
         string port = NormalizePort(request.port_name);
-        int code = V2ClearCardEx(port, 1);
-        if (code != 0) { SdkError(context.Response, "clear", code, port); return; }
-        WriteJson(context.Response, new { status = "success", message = "HS Lock card cleared" });
+        int sector = SavedSector();
+        int code = V2ClearCardEx(port, sector);
+        if (code != 0) { SdkError(context.Response, "clear", code, port, sector); return; }
+        WriteJson(context.Response, new { status = "success", message = "HS Lock card cleared", sector = sector });
     }
 
     private static string ValidateWrite(CardRequest request)
@@ -161,10 +200,42 @@ internal static class Program
     private static string NormalizePort(string value) { return string.IsNullOrWhiteSpace(value) ? "COM1" : value.Trim().ToUpperInvariant(); }
     private static string CardType(int type) { return type == 0 ? "blank" : type == 1 ? "guest" : type.ToString(); }
 
-    private static void SdkError(HttpListenerResponse response, string operation, int code, string port)
+    private static bool TryReadCard(string port, out V2CardInfo card, out int detectedSector, out int lastCode)
+    {
+        int preferredSector = SavedSector();
+        card = new V2CardInfo();
+        lastCode = V2ReadCardEx(port, preferredSector, ref card);
+        if (lastCode == 0) { detectedSector = preferredSector; return true; }
+
+        for (int sector = 1; sector <= 15; sector++)
+        {
+            if (sector == preferredSector) continue;
+            card = new V2CardInfo();
+            lastCode = V2ReadCardEx(port, sector, ref card);
+            if (lastCode == 0) { detectedSector = sector; return true; }
+        }
+
+        detectedSector = preferredSector;
+        return false;
+    }
+
+    private static int SavedSector()
+    {
+        int sector;
+        return File.Exists(SectorPath)
+            && int.TryParse(File.ReadAllText(SectorPath).Trim(), out sector)
+            && sector >= 1 && sector <= 15 ? sector : 1;
+    }
+
+    private static void SaveSector(int sector)
+    {
+        File.WriteAllText(SectorPath, sector.ToString(CultureInfo.InvariantCulture));
+    }
+
+    private static void SdkError(HttpListenerResponse response, string operation, int code, string port, int sector)
     {
         string detail = code == -1 ? "No response from the card or encoder" : code == 1 ? "Invalid parameters" : code == 2 ? "Unable to open the COM port" : code == 3 ? "Unable to write to the encoder" : code == 4 ? "Unable to read from the encoder or card" : "Unknown SDK error";
-        WriteJson(response, new { status = "error", message = "HS Lock " + operation + " failed: " + detail, sdk_code = code, port_name = port });
+        WriteJson(response, new { status = "error", message = "HS Lock " + operation + " failed: " + detail, sdk_code = code, port_name = port, sector = sector });
     }
 
     private static T Body<T>(HttpListenerRequest request) where T : class
